@@ -1,10 +1,4 @@
 import os
-# Pre-configure environment for Railway
-import sys
-if 'railway' in os.getenv('RAILWAY_ENVIRONMENT_NAME', '').lower():
-    os.environ['NO_NUMBA'] = '1'  # Disable numba for pandas-ta
-    os.environ['PYTHONUNBUFFERED'] = '1'
-
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
@@ -15,250 +9,282 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 import logging
-import sys
-from typing import Optional, Tuple, List
+from typing import List, Dict, Optional, Tuple
 
 # ===== Configuration =====
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SYMBOLS_FILE = "under_100rs_stocks.csv"  # Local file in repository
-DATA_DAYS = 5  # Reduced lookback period for memory efficiency
-CHECK_INTERVAL = 300  # 5 minutes between scans
-MAX_CONCURRENT_REQUESTS = 3  # Conservative for Railway's free tier
-RISK_REWARD_RATIO = 2
+class Config:
+    # Core Settings
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    SYMBOLS_FILE = "stocks.csv"
+    
+    # Trading Parameters
+    RISK_PER_TRADE = 0.02  # 2% of capital per trade
+    MIN_RISK_REWARD = 2.0  # 1:2 minimum
+    POSITION_SIZE_DAYS = 30  # For volatility calculation
+    
+    # Technical Parameters
+    RSI_OVERSOLD = 30
+    RSI_OVERBOUGHT = 70
+    VOLUME_SPIKE = 1.8  # 180% of average volume
 
-# ===== Logging Setup =====
+# ===== Logging =====
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), logging.FileHandler('bot.log')]
 )
 logger = logging.getLogger(__name__)
-logging.getLogger('httpx').setLevel(logging.WARNING)  # Reduce noise
 
-class TradingBot:
+class ProfessionalTradingBot:
     def __init__(self):
         self.app = None
         self.client = httpx.AsyncClient(timeout=30.0)
         self.symbols = self._load_symbols()
-        self.failed_symbols = set()
+        self.portfolio = {}  # Track live positions
         self.market_tz = ZoneInfo("Asia/Kolkata")
         self.paused = False
-        self.signal_cache = {}
 
-    def _load_symbols(self) -> List[str]:
-        """Load and validate trading symbols"""
-        try:
-            if not os.path.exists(SYMBOLS_FILE):
-                logger.critical(f"Symbols file not found: {SYMBOLS_FILE}")
-                sys.exit(1)
+    # ===== 8 Profit Techniques =====
+    
+    # 1. Multi-Timeframe Analysis
+    async def _get_multi_tf_data(self, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Fetch daily + intraday data"""
+        daily = await self._fetch_data(symbol, "1d")
+        intraday = await self._fetch_data(symbol, "15m")
+        return daily, intraday
 
-            df = pd.read_csv(SYMBOLS_FILE)
-            if 'Symbol' not in df.columns:
-                logger.critical("CSV missing 'Symbol' column")
-                sys.exit(1)
+    # 2. Volume-Weighted Signals
+    def _check_volume_spike(self, data: pd.DataFrame) -> bool:
+        return data['Volume'].iloc[-1] > (Config.VOLUME_SPIKE * data['Volume'].rolling(20).mean().iloc[-1])
 
-            symbols = [f"{s.strip().upper()}.NS" for s in df['Symbol'].dropna()]
-            logger.info(f"Loaded {len(symbols)} symbols")
-            return symbols
-        except Exception as e:
-            logger.critical(f"Symbol loading failed: {str(e)}")
-            sys.exit(1)
+    # 3. Smart Position Sizing
+    def _calculate_position_size(self, symbol: str, entry: float, stop_loss: float) -> float:
+        """Calculate shares based on volatility"""
+        hist_data = yf.download(symbol, period=f"{Config.POSITION_SIZE_DAYS}d")['Close']
+        volatility = hist_data.pct_change().std()
+        risk_amount = 10000 * Config.RISK_PER_TRADE  # Example ₹10k capital
+        return risk_amount / (entry - stop_loss) / volatility
 
-    async def start(self):
-        """Main entry point with initialization"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.critical("Missing Telegram credentials in environment variables")
-            sys.exit(1)
+    # 4. Trend Confirmation
+    def _check_trend_alignment(self, daily_data: pd.DataFrame) -> bool:
+        sma50 = ta.sma(daily_data['Close'], length=50).iloc[-1]
+        sma200 = ta.sma(daily_data['Close'], length=200).iloc[-1]
+        return daily_data['Close'].iloc[-1] > sma50 > sma200  # Bullish stack
 
-        self.app = Application.builder().token(TELEGRAM_TOKEN).build()
-        self.app.add_handler(CommandHandler("pause", self._pause_bot))
-        self.app.add_handler(CommandHandler("resume", self._resume_bot))
-        self.app.add_handler(CommandHandler("status", self._get_status))
+    # 5. Candlestick Patterns
+    def _detect_candlestick_patterns(self, data: pd.DataFrame) -> List[str]:
+        patterns = []
+        latest = data.iloc[-3:]  # Last 3 candles
+        
+        # Bullish Engulfing
+        if (latest.iloc[-2]['Close'] < latest.iloc[-2]['Open'] and 
+            latest.iloc[-1]['Close'] > latest.iloc[-1]['Open'] and
+            latest.iloc[-1]['Close'] > latest.iloc[-2]['Open']):
+            patterns.append("Bullish Engulfing")
+            
+        return patterns
 
-        await self._send_telegram_message("🚀 Trading Bot Activated")
-        await self._run_trading_loop()
+    # 6. Risk-Managed Entries
+    def _calculate_risk(self, entry: float, atr: float) -> Tuple[float, float]:
+        stop_loss = entry - (1.5 * atr)
+        take_profit = entry + (3 * atr)
+        return stop_loss, take_profit
 
-    async def _run_trading_loop(self):
-        """Continuous trading signal generation"""
-        while True:
-            try:
-                if self.paused:
-                    await asyncio.sleep(60)
-                    continue
+    # 7. News/Sentiment Filter (Placeholder)
+    async def _check_news_sentiment(self, symbol: str) -> bool:
+        """Integrate with NewsAPI or similar"""
+        return True  # Placeholder
 
-                if not self._is_market_open():
-                    logger.debug("Market closed - sleeping")
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
+    # 8. Dynamic Exit Strategy
+    def _trailing_stop(self, current_price: float, entry: float) -> float:
+        return max(current_price * 0.98, entry * 1.03)  # 2% trail or 3% profit lock
 
-                active_symbols = [s for s in self.symbols if s not in self.failed_symbols]
-                logger.info(f"Scanning {len(active_symbols)} symbols")
+    # ===== Core Methods =====
+    def _is_market_open(self) -> bool:
+        """Check if market is open (9:15 AM - 3:30 PM IST, Mon-Fri)"""
+        now = datetime.now(self.market_tz)
+        return (now.weekday() < 5 and 
+                dtime(9, 15) <= now.time() <= dtime(15, 30))
 
-                # Process in batches to avoid rate limits
-                for i in range(0, len(active_symbols), MAX_CONCURRENT_REQUESTS):
-                    batch = active_symbols[i:i + MAX_CONCURRENT_REQUESTS]
-                    await self._process_batch(batch)
-                    await asyncio.sleep(5)  # Rate limiting
-
-                await asyncio.sleep(CHECK_INTERVAL)
-
-            except Exception as e:
-                logger.error(f"Trading loop error: {str(e)}")
-                await asyncio.sleep(60)
-
-    async def _process_batch(self, symbols: List[str]):
-        """Process a batch of symbols concurrently"""
-        tasks = [self._analyze_symbol(symbol) for symbol in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for symbol, result in zip(symbols, results):
-            if isinstance(result, Exception):
-                logger.warning(f"Analysis failed for {symbol}: {str(result)}")
-                self.failed_symbols.add(symbol)
-            elif result:
-                signal, price, notes = result
-                await self._send_trading_alert(signal, symbol, price, notes)
-
-    async def _analyze_symbol(self, symbol: str) -> Optional[Tuple[str, float, List[str]]]:
-        """Generate trading signal for a single symbol"""
-        try:
-            data = await self._fetch_stock_data(symbol)
-            if data is None or data.empty:
-                return None
+    async def _manage_positions(self):
+        """Check open positions for exits"""
+        for symbol, trade in list(self.portfolio.items()):
+            data = await self._fetch_data(symbol, "15m")
+            if data is None:
+                continue
 
             current_price = data['Close'].iloc[-1]
-            rsi = ta.rsi(data['Close'], length=14).iloc[-1]
-            macd = ta.macd(data['Close']).iloc[-1]
-            sma20 = ta.sma(data['Close'], length=20).iloc[-1]
+            
+            # Check stop-loss or take-profit
+            if current_price <= trade['sl'] or current_price >= trade['tp']:
+                await self._close_position(symbol, current_price)
+            
+            # Update trailing stop
+            elif current_price > trade['entry'] * 1.03:  # After 3% profit
+                new_sl = self._trailing_stop(current_price, trade['entry'])
+                if new_sl > trade['sl']:
+                    self.portfolio[symbol]['sl'] = new_sl
 
-            notes = []
-            buy_conditions = 0
-            sell_conditions = 0
+    async def _close_position(self, symbol: str, exit_price: float):
+        """Handle position closing"""
+        trade = self.portfolio.pop(symbol)
+        pnl = (exit_price - trade['entry']) * trade['size']
+        
+        message = [
+            f"🔴 <b>CLOSE {symbol}</b>",
+            f"💰 Exit: ₹{exit_price:.2f}",
+            f"📈 P&L: ₹{pnl:.2f} ({pnl/(trade['entry']*trade['size']):.1%})",
+            f"⏱️ Duration: {(datetime.now() - trade['entry_time']).seconds//60} mins"
+        ]
+        await self._send_telegram("\n".join(message))
 
-            # Buy signal conditions
-            if rsi < 30:
-                notes.append(f"RSI {rsi:.1f} (Oversold)")
-                buy_conditions += 1
-            if macd['MACD_12_26_9'] > macd['MACDs_12_26_9']:
-                notes.append("MACD Bullish")
-                buy_conditions += 1
-            if current_price > sma20:
-                notes.append("Price > SMA20")
-                buy_conditions += 1
-
-            # Sell signal conditions
-            if rsi > 70:
-                notes.append(f"RSI {rsi:.1f} (Overbought)")
-                sell_conditions += 1
-            if macd['MACD_12_26_9'] < macd['MACDs_12_26_9']:
-                notes.append("MACD Bearish")
-                sell_conditions += 1
-            if current_price < sma20:
-                notes.append("Price < SMA20")
-                sell_conditions += 1
-
-            if buy_conditions >= 2 and buy_conditions > sell_conditions:
-                return ('BUY', current_price, notes)
-            elif sell_conditions >= 2 and sell_conditions > buy_conditions:
-                return ('SELL', current_price, notes)
-
+    # ===== Trading Logic =====
+    async def _analyze_symbol(self, symbol: str) -> Optional[Dict]:
+        """Complete analysis with all 8 techniques"""
+        daily, intraday = await self._get_multi_tf_data(symbol)
+        if daily is None or intraday is None:
             return None
 
-        except Exception as e:
-            logger.warning(f"Analysis error for {symbol}: {str(e)}")
-            raise e
+        # Technical Indicators
+        atr = ta.atr(intraday['High'], intraday['Low'], intraday['Close'], length=14).iloc[-1]
+        rsi = ta.rsi(intraday['Close'], length=14).iloc[-1]
+        macd = ta.macd(intraday['Close']).iloc[-1]
+        patterns = self._detect_candlestick_patterns(intraday)
 
-    async def _fetch_stock_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Fetch stock data with retry logic"""
+        # Price Action
+        price = intraday['Close'].iloc[-1]
+        stop_loss, take_profit = self._calculate_risk(price, atr)
+        risk_reward = (take_profit - price) / (price - stop_loss)
+
+        # Signal Generation
+        buy_conditions = [
+            rsi < Config.RSI_OVERSOLD,
+            macd['MACD_12_26_9'] > macd['MACDs_12_26_9'],
+            self._check_trend_alignment(daily),
+            self._check_volume_spike(intraday),
+            "Bullish Engulfing" in patterns,
+            await self._check_news_sentiment(symbol),
+            risk_reward >= Config.MIN_RISK_REWARD
+        ]
+
+        if sum(buy_conditions) >= 5:  # Require 5/7 conditions
+            position_size = self._calculate_position_size(symbol, price, stop_loss)
+            return {
+                'symbol': symbol,
+                'action': 'BUY',
+                'price': price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'size': int(position_size),
+                'rationale': [
+                    f"RSI: {rsi:.1f}",
+                    f"ATR: {atr:.2f}",
+                    f"Risk/Reward: 1:{risk_reward:.1f}",
+                    f"Size: {int(position_size)} shares"
+                ] + patterns
+            }
+        return None
+
+    # ===== Execution =====
+    async def _execute_trade(self, signal: Dict):
+        """Execute trade with risk management"""
+        self.portfolio[signal['symbol']] = {
+            'entry': signal['price'],
+            'sl': signal['stop_loss'],
+            'tp': signal['take_profit'],
+            'size': signal['size'],
+            'entry_time': datetime.now()
+        }
+        
+        message = [
+            f"🚀 <b>{signal['action']} {signal['symbol']}</b>",
+            f"🔢 Size: {signal['size']} shares",
+            f"💰 Entry: ₹{signal['price']:.2f}",
+            f"🛑 Stop-Loss: ₹{signal['stop_loss']:.2f}",
+            f"🎯 Take-Profit: ₹{signal['take_profit']:.2f}",
+            "",
+            "<b>Rationale:</b>",
+            *signal['rationale']
+        ]
+        await self._send_telegram("\n".join(message))
+
+    # ===== Utilities =====
+    def _load_symbols(self) -> List[str]:
+        """Load symbols from CSV"""
         try:
-            interval = "15m" if self._is_market_open() else "1d"
+            df = pd.read_csv(Config.SYMBOLS_FILE)
+            return [f"{s.strip().upper()}.NS" for s in df['Symbol'].dropna()]
+        except Exception as e:
+            logger.critical(f"Failed to load symbols: {e}")
+            sys.exit(1)
+
+    async def _fetch_data(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
+        """Fetch market data"""
+        try:
             data = await asyncio.to_thread(
                 yf.download,
                 symbol,
-                period=f"{DATA_DAYS}d",
+                period=f"{max(Config.POSITION_SIZE_DAYS, 30)}d",
                 interval=interval,
-                progress=False,
-                auto_adjust=True
+                progress=False
             )
             return data if not data.empty else None
         except Exception as e:
-            logger.debug(f"Data fetch failed for {symbol}: {str(e)}")
+            logger.error(f"Data fetch failed for {symbol}: {e}")
             return None
 
-    def _is_market_open(self) -> bool:
-        """Check if Indian stock market is open"""
-        now = datetime.now(self.market_tz)
-        return (now.weekday() < 5 and  # Monday-Friday
-                dtime(9, 15) <= now.time() <= dtime(15, 30))
-
-    # ===== Telegram Methods =====
-    async def _send_trading_alert(self, signal: str, symbol: str, price: float, notes: List[str]):
-        """Send formatted trading alert"""
-        emoji = "🟢" if signal == "BUY" else "🔴"
-        message = [
-            f"{emoji} <b>{signal} {symbol}</b> {emoji}",
-            f"Price: ₹{price:.2f}",
-            "",
-            "<b>Rationale:</b>",
-            *notes,
-            "",
-            f"<i>{datetime.now(self.market_tz).strftime('%Y-%m-%d %H:%M:%S')}</i>"
-        ]
-        await self._send_telegram_message("\n".join(message))
-
-    async def _send_telegram_message(self, text: str):
-        """Safe message sending with retry"""
+    async def _send_telegram(self, text: str):
+        """Send message with error handling"""
         try:
             await self.app.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
+                chat_id=Config.TELEGRAM_CHAT_ID,
                 text=text,
                 parse_mode='HTML'
             )
         except Exception as e:
-            logger.error(f"Telegram send failed: {str(e)}")
-
-    # ===== Command Handlers =====
-    async def _pause_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.paused = True
-        await update.message.reply_text("⏸️ Bot paused")
-
-    async def _resume_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.paused = False
-        await update.message.reply_text("▶️ Bot resumed")
+            logger.error(f"Telegram send failed: {e}")
 
     async def _get_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Telegram command handler"""
         status = [
-            f"🔍 <b>Bot Status</b>",
+            f"📊 <b>Bot Status</b>",
             f"• Symbols: {len(self.symbols)}",
-            f"• Failed: {len(self.failed_symbols)}",
-            f"• Market: {'Open' if self._is_market_open() else 'Closed'}",
-            f"• State: {'Paused' if self.paused else 'Running'}"
+            f"• Positions: {len(self.portfolio)}",
+            f"• Market: {'Open' if self._is_market_open() else 'Closed'}"
         ]
         await update.message.reply_text("\n".join(status), parse_mode='HTML')
 
+    # ===== Main Loop =====
+    async def run(self):
+        """Complete trading workflow"""
+        self.app = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+        self.app.add_handler(CommandHandler("status", self._get_status))
+        
+        await self._send_telegram("💼 Professional Bot Activated")
+        
+        while True:
+            try:
+                if self.paused or not self._is_market_open():
+                    await asyncio.sleep(60)
+                    continue
+
+                for symbol in self.symbols:
+                    signal = await self._analyze_symbol(symbol)
+                    if signal:
+                        await self._execute_trade(signal)
+                        await asyncio.sleep(1)  # Rate limit
+
+                await self._manage_positions()
+                await asyncio.sleep(300)  # 5 min interval
+
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                await asyncio.sleep(60)
+
 async def main():
-    bot = TradingBot()
-    try:
-        await bot.start()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("Shutting down gracefully...")
-    except Exception as e:
-        logger.critical(f"Fatal error: {str(e)}")
-    finally:
-        await bot.client.aclose()
-        if bot.app:
-            await bot.app.shutdown()
+    bot = ProfessionalTradingBot()
+    await bot.run()
 
 if __name__ == "__main__":
-    # Verify required environment variables
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Error: Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in environment")
-        sys.exit(1)
-
-    # Configure event loop policy for Windows compatibility
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    # Start the application
     asyncio.run(main())
