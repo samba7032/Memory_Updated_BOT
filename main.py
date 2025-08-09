@@ -1,4 +1,10 @@
 import os
+# Pre-configure environment for Railway
+import sys
+if 'railway' in os.getenv('RAILWAY_ENVIRONMENT_NAME', '').lower():
+    os.environ['NO_NUMBA'] = '1'  # Disable numba for pandas-ta
+    os.environ['PYTHONUNBUFFERED'] = '1'
+
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
