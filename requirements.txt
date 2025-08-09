@@ -1,9 +1,8 @@
-yfinance==0.2.31
-pandas==1.5.3
-python-telegram-bot==20.3
-pandas-ta==0.3.14b0
-httpx==0.25.2
-python-dotenv==1.0.0
-psutil==5.9.6
-pytz==2023.3
-tzdata==2023.3
+yfinance
+pandas
+python-telegram-bot
+ta
+httpx
+python-dotenv
+python-dateutil
+pytz
