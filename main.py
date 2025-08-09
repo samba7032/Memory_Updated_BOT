@@ -21,7 +21,7 @@ from typing import Optional, Tuple, List
 # ===== Configuration =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SYMBOLS_FILE = "symbols.csv"  # Local file in repository
+SYMBOLS_FILE = "under_100rs_stocks.csv"  # Local file in repository
 DATA_DAYS = 5  # Reduced lookback period for memory efficiency
 CHECK_INTERVAL = 300  # 5 minutes between scans
 MAX_CONCURRENT_REQUESTS = 3  # Conservative for Railway's free tier
