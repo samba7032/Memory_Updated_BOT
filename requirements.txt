@@ -1,9 +1,20 @@
+# Core Dependencies (pinned versions)
 yfinance==0.2.31
 pandas==1.5.3
+numpy==1.23.5
+
+# Telegram (with compatible HTTPX)
 python-telegram-bot==20.3
+httpx==0.24.0  # Matches python-telegram-bot's requirement
+
+# Technical Analysis
 pandas-ta==0.3.14b0
-httpx==0.25.2
+
+# Utilities
 python-dotenv==1.0.0
 pytz==2023.3
 tzdata==2023.3
-numpy==1.23.5
+
+# Build Tools
+setuptools==68.0.0
+wheel==0.41.2
