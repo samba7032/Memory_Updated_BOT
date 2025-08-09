@@ -16,7 +16,7 @@ class Config:
     # Core Settings
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-    SYMBOLS_FILE = "stocks.csv"
+    SYMBOLS_FILE = "under_100rs_stocks.csv"
     
     # Trading Parameters
     RISK_PER_TRADE = 0.02  # 2% of capital per trade
