@@ -10,6 +10,7 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 import logging
 from typing import List, Dict, Optional, Tuple
+import sys
 
 # ===== Configuration =====
 class Config:
@@ -214,25 +215,30 @@ class ProfessionalTradingBot:
         """Load symbols from CSV"""
         try:
             df = pd.read_csv(Config.SYMBOLS_FILE)
-            return [f"{s.strip().upper()}.NS" for s in df['Symbol'].dropna()]
+            # Fix: Remove any existing .NS and add it once
+            return [f"{s.strip().upper().replace('.NS', '')}.NS" for s in df['Symbol'].dropna()]
         except Exception as e:
             logger.critical(f"Failed to load symbols: {e}")
             sys.exit(1)
 
-    async def _fetch_data(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
-        """Fetch market data"""
-        try:
-            data = await asyncio.to_thread(
-                yf.download,
-                symbol,
-                period=f"{max(Config.POSITION_SIZE_DAYS, 30)}d",
-                interval=interval,
-                progress=False
-            )
-            return data if not data.empty else None
-        except Exception as e:
-            logger.error(f"Data fetch failed for {symbol}: {e}")
-            return None
+    async def _fetch_data(self, symbol: str, interval: str, retries: int = 3) -> Optional[pd.DataFrame]:
+        """Fetch market data with retry logic"""
+        for attempt in range(retries):
+            try:
+                data = await asyncio.to_thread(
+                    yf.download,
+                    symbol,
+                    period=f"{max(Config.POSITION_SIZE_DAYS, 30)}d",
+                    interval=interval,
+                    progress=False
+                )
+                if not data.empty:
+                    return data
+                logger.warning(f"Empty data for {symbol}, attempt {attempt + 1}/{retries}")
+            except Exception as e:
+                logger.warning(f"Data fetch failed for {symbol}: {e}, attempt {attempt + 1}/{retries}")
+            await asyncio.sleep(2)  # Wait before retry
+        return None
 
     async def _send_telegram(self, text: str):
         """Send message with error handling"""
@@ -263,6 +269,20 @@ class ProfessionalTradingBot:
         
         await self._send_telegram("💼 Professional Bot Activated")
         
+        # Validate all symbols at startup
+        valid_symbols = []
+        for symbol in self.symbols:
+            try:
+                data = await self._fetch_data(symbol, "1d")
+                if data is not None and not data.empty:
+                    valid_symbols.append(symbol)
+                else:
+                    logger.warning(f"Removing invalid symbol: {symbol}")
+            except Exception as e:
+                logger.error(f"Error validating {symbol}: {e}")
+        self.symbols = valid_symbols
+        logger.info(f"Loaded {len(valid_symbols)} valid symbols out of {len(self.symbols)} initial symbols")
+        
         while True:
             try:
                 if self.paused or not self._is_market_open():
@@ -270,10 +290,13 @@ class ProfessionalTradingBot:
                     continue
 
                 for symbol in self.symbols:
-                    signal = await self._analyze_symbol(symbol)
-                    if signal:
-                        await self._execute_trade(signal)
-                        await asyncio.sleep(1)  # Rate limit
+                    try:
+                        signal = await self._analyze_symbol(symbol)
+                        if signal:
+                            await self._execute_trade(signal)
+                            await asyncio.sleep(1)  # Rate limit
+                    except Exception as e:
+                        logger.error(f"Error processing {symbol}: {e}")
 
                 await self._manage_positions()
                 await asyncio.sleep(300)  # 5 min interval
