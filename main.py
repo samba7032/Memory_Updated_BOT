@@ -46,6 +46,7 @@ class ProfessionalTradingBot:
         self.market_tz = ZoneInfo("Asia/Kolkata")
         self.paused = False
         self.blacklisted_symbols = set()  # Track symbols that consistently fail
+        self.symbol_validation_attempts = 3  # Number of attempts to validate symbols
 
     # ===== 8 Profit Techniques =====
     
@@ -216,11 +217,26 @@ class ProfessionalTradingBot:
 
     # ===== Utilities =====
     def _load_symbols(self) -> List[str]:
-        """Load symbols from CSV"""
+        """Load symbols from CSV with enhanced validation"""
         try:
+            # Read CSV and clean symbols
             df = pd.read_csv(Config.SYMBOLS_FILE)
-            # Fix: Remove any existing .NS and add it once
-            return [f"{s.strip().upper().replace('.NS', '')}.NS" for s in df['Symbol'].dropna()]
+            raw_symbols = [s.strip().upper() for s in df['Symbol'].dropna()]
+            
+            # Remove duplicates and empty strings
+            unique_symbols = list(set(s for s in raw_symbols if s))
+            
+            # Add .NS suffix if not present, but don't double it
+            processed_symbols = []
+            for symbol in unique_symbols:
+                if not symbol.endswith('.NS'):
+                    processed_symbols.append(f"{symbol}.NS")
+                else:
+                    processed_symbols.append(symbol)
+            
+            logger.info(f"Loaded {len(processed_symbols)} symbols from CSV")
+            return processed_symbols
+            
         except Exception as e:
             logger.critical(f"Failed to load symbols: {e}")
             sys.exit(1)
@@ -232,22 +248,28 @@ class ProfessionalTradingBot:
 
         for attempt in range(retries):
             try:
+                logger.info(f"Fetching {symbol} ({interval}), attempt {attempt + 1}/{retries}")
+                
+                # Use smaller period for intraday data to reduce load
+                period = "60d" if interval == "1d" else "7d"
+                
                 data = await asyncio.to_thread(
                     yf.download,
                     symbol,
-                    period=f"{max(Config.POSITION_SIZE_DAYS, 30)}d",
+                    period=period,
                     interval=interval,
-                    progress=False
+                    progress=False,
+                    threads=False  # Disable parallel downloads to reduce errors
                 )
                 
                 if data.empty:
                     logger.warning(f"Empty data for {symbol}, attempt {attempt + 1}/{retries}")
-                    if attempt == retries - 1:  # Last attempt failed
+                    if attempt == retries - 1:
                         self.blacklisted_symbols.add(symbol)
-                        logger.error(f"Adding {symbol} to blacklist - consistently returns empty data")
+                        logger.error(f"Adding {symbol} to blacklist - empty data")
                     continue
                 
-                # Additional validation for bad data
+                # Check for all NA values
                 if data['Close'].isna().all() or data['Volume'].isna().all():
                     logger.warning(f"Invalid data (all NA) for {symbol}, attempt {attempt + 1}/{retries}")
                     if attempt == retries - 1:
@@ -259,10 +281,6 @@ class ProfessionalTradingBot:
 
             except Exception as e:
                 logger.warning(f"Data fetch failed for {symbol}: {str(e)}, attempt {attempt + 1}/{retries}")
-                if "No timezone found" in str(e):
-                    logger.error(f"Timezone issue with {symbol}, adding to blacklist")
-                    self.blacklisted_symbols.add(symbol)
-                    break
                 if attempt == retries - 1:
                     self.blacklisted_symbols.add(symbol)
                     logger.error(f"Adding {symbol} to blacklist after failed retries")
@@ -270,6 +288,51 @@ class ProfessionalTradingBot:
             await asyncio.sleep(2)  # Wait before retry
         
         return None
+
+    async def _validate_symbols(self):
+        """Validate all symbols with detailed logging"""
+        valid_symbols = []
+        
+        logger.info(f"Starting validation of {len(self.symbols)} symbols...")
+        
+        for symbol in self.symbols:
+            validation_success = False
+            
+            for attempt in range(self.symbol_validation_attempts):
+                try:
+                    data = await self._fetch_data(symbol, "1d")
+                    
+                    if data is not None and not data.empty:
+                        # Additional checks for valid data
+                        last_close = data['Close'].iloc[-1]
+                        last_volume = data['Volume'].iloc[-1]
+                        
+                        if pd.notna(last_close) and pd.notna(last_volume) and last_close > 0:
+                            valid_symbols.append(symbol)
+                            validation_success = True
+                            logger.info(f"✅ Validated {symbol} (Close: {last_close:.2f}, Volume: {last_volume:,.0f})")
+                            break
+                        else:
+                            logger.warning(f"Invalid data for {symbol} (Close: {last_close}, Volume: {last_volume})")
+                    else:
+                        logger.warning(f"No data returned for {symbol}")
+                    
+                except Exception as e:
+                    logger.error(f"Validation error for {symbol}: {str(e)}")
+                
+                await asyncio.sleep(1)  # Short delay between attempts
+            
+            if not validation_success:
+                logger.warning(f"❌ Failed to validate {symbol} after {self.symbol_validation_attempts} attempts")
+                self.blacklisted_symbols.add(symbol)
+        
+        self.symbols = valid_symbols
+        logger.info(f"Validation complete. {len(valid_symbols)} valid symbols, {len(self.blacklisted_symbols)} blacklisted")
+        
+        if not valid_symbols:
+            error_msg = "❌ CRITICAL: No valid symbols found! Check your symbols file and network connection."
+            logger.error(error_msg)
+            await self._send_telegram(error_msg)
 
     async def _send_telegram(self, text: str):
         """Send message with error handling"""
@@ -293,29 +356,31 @@ class ProfessionalTradingBot:
         ]
         await update.message.reply_text("\n".join(status), parse_mode='HTML')
 
+    async def _list_symbols(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all valid and blacklisted symbols"""
+        valid_msg = "✅ Valid Symbols:\n" + "\n".join(self.symbols) if self.symbols else "No valid symbols"
+        blacklisted_msg = "❌ Blacklisted Symbols:\n" + "\n".join(self.blacklisted_symbols) if self.blacklisted_symbols else "No blacklisted symbols"
+        
+        await update.message.reply_text(
+            f"{valid_msg}\n\n{blacklisted_msg}",
+            parse_mode='HTML'
+        )
+
     # ===== Main Loop =====
     async def run(self):
         """Complete trading workflow"""
         self.app = Application.builder().token(Config.TELEGRAM_TOKEN).build()
         self.app.add_handler(CommandHandler("status", self._get_status))
+        self.app.add_handler(CommandHandler("symbols", self._list_symbols))
         
         await self._send_telegram("💼 Professional Bot Activated")
         
-        # Validate all symbols at startup
-        valid_symbols = []
-        for symbol in self.symbols:
-            try:
-                data = await self._fetch_data(symbol, "1d")
-                if data is not None and not data.empty:
-                    valid_symbols.append(symbol)
-                    logger.info(f"Validated symbol: {symbol}")
-                else:
-                    logger.warning(f"Removing invalid symbol: {symbol}")
-            except Exception as e:
-                logger.error(f"Error validating {symbol}: {str(e)}")
+        # Validate symbols with detailed logging
+        await self._validate_symbols()
         
-        self.symbols = valid_symbols
-        logger.info(f"Loaded {len(valid_symbols)} valid symbols out of {len(self.symbols)} initial symbols")
+        if not self.symbols:
+            logger.error("No valid symbols available. Exiting.")
+            return
         
         while True:
             try:
