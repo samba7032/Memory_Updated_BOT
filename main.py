@@ -45,6 +45,7 @@ class ProfessionalTradingBot:
         self.portfolio = {}  # Track live positions
         self.market_tz = ZoneInfo("Asia/Kolkata")
         self.paused = False
+        self.blacklisted_symbols = set()  # Track symbols that consistently fail
 
     # ===== 8 Profit Techniques =====
     
@@ -143,6 +144,9 @@ class ProfessionalTradingBot:
     # ===== Trading Logic =====
     async def _analyze_symbol(self, symbol: str) -> Optional[Dict]:
         """Complete analysis with all 8 techniques"""
+        if symbol in self.blacklisted_symbols:
+            return None
+
         daily, intraday = await self._get_multi_tf_data(symbol)
         if daily is None or intraday is None:
             return None
@@ -222,7 +226,10 @@ class ProfessionalTradingBot:
             sys.exit(1)
 
     async def _fetch_data(self, symbol: str, interval: str, retries: int = 3) -> Optional[pd.DataFrame]:
-        """Fetch market data with retry logic"""
+        """Fetch market data with enhanced error handling"""
+        if symbol in self.blacklisted_symbols:
+            return None
+
         for attempt in range(retries):
             try:
                 data = await asyncio.to_thread(
@@ -232,12 +239,36 @@ class ProfessionalTradingBot:
                     interval=interval,
                     progress=False
                 )
-                if not data.empty:
-                    return data
-                logger.warning(f"Empty data for {symbol}, attempt {attempt + 1}/{retries}")
+                
+                if data.empty:
+                    logger.warning(f"Empty data for {symbol}, attempt {attempt + 1}/{retries}")
+                    if attempt == retries - 1:  # Last attempt failed
+                        self.blacklisted_symbols.add(symbol)
+                        logger.error(f"Adding {symbol} to blacklist - consistently returns empty data")
+                    continue
+                
+                # Additional validation for bad data
+                if data['Close'].isna().all() or data['Volume'].isna().all():
+                    logger.warning(f"Invalid data (all NA) for {symbol}, attempt {attempt + 1}/{retries}")
+                    if attempt == retries - 1:
+                        self.blacklisted_symbols.add(symbol)
+                        logger.error(f"Adding {symbol} to blacklist - invalid data")
+                    continue
+                
+                return data
+
             except Exception as e:
-                logger.warning(f"Data fetch failed for {symbol}: {e}, attempt {attempt + 1}/{retries}")
+                logger.warning(f"Data fetch failed for {symbol}: {str(e)}, attempt {attempt + 1}/{retries}")
+                if "No timezone found" in str(e):
+                    logger.error(f"Timezone issue with {symbol}, adding to blacklist")
+                    self.blacklisted_symbols.add(symbol)
+                    break
+                if attempt == retries - 1:
+                    self.blacklisted_symbols.add(symbol)
+                    logger.error(f"Adding {symbol} to blacklist after failed retries")
+            
             await asyncio.sleep(2)  # Wait before retry
+        
         return None
 
     async def _send_telegram(self, text: str):
@@ -256,7 +287,8 @@ class ProfessionalTradingBot:
         status = [
             f"📊 <b>Bot Status</b>",
             f"• Symbols: {len(self.symbols)}",
-            f"• Positions: {len(self.portfolio)}",
+            f"• Active Positions: {len(self.portfolio)}",
+            f"• Blacklisted Symbols: {len(self.blacklisted_symbols)}",
             f"• Market: {'Open' if self._is_market_open() else 'Closed'}"
         ]
         await update.message.reply_text("\n".join(status), parse_mode='HTML')
@@ -276,10 +308,12 @@ class ProfessionalTradingBot:
                 data = await self._fetch_data(symbol, "1d")
                 if data is not None and not data.empty:
                     valid_symbols.append(symbol)
+                    logger.info(f"Validated symbol: {symbol}")
                 else:
                     logger.warning(f"Removing invalid symbol: {symbol}")
             except Exception as e:
-                logger.error(f"Error validating {symbol}: {e}")
+                logger.error(f"Error validating {symbol}: {str(e)}")
+        
         self.symbols = valid_symbols
         logger.info(f"Loaded {len(valid_symbols)} valid symbols out of {len(self.symbols)} initial symbols")
         
@@ -290,19 +324,24 @@ class ProfessionalTradingBot:
                     continue
 
                 for symbol in self.symbols:
+                    if symbol in self.blacklisted_symbols:
+                        continue
+                        
                     try:
                         signal = await self._analyze_symbol(symbol)
                         if signal:
                             await self._execute_trade(signal)
                             await asyncio.sleep(1)  # Rate limit
                     except Exception as e:
-                        logger.error(f"Error processing {symbol}: {e}")
+                        logger.error(f"Error processing {symbol}: {str(e)}")
+                        if "No data found" in str(e):
+                            self.blacklisted_symbols.add(symbol)
 
                 await self._manage_positions()
                 await asyncio.sleep(300)  # 5 min interval
 
             except Exception as e:
-                logger.error(f"Main loop error: {e}")
+                logger.error(f"Main loop error: {str(e)}")
                 await asyncio.sleep(60)
 
 async def main():
