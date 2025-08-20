@@ -1,327 +1,330 @@
 import os
-import yfinance as yf
-import pandas as pd
-import pandas_ta as ta
-import asyncio
-import httpx
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from datetime import datetime, time as dtime
-from zoneinfo import ZoneInfo
-import logging
-from typing import List, Dict, Optional, Tuple
-import sys
 import time
+import math
+import requests
+import pandas as pd
+import yfinance as yf
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-# ===== Configuration =====
-class Config:
-    # Core Settings
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-    SYMBOLS_FILE = "under_100rs_stocks.csv"
-    
-    # Yahoo Finance Settings
-    YFINANCE_RATE_LIMIT = 2  # Requests per second
-    VALIDATION_TIMEOUT = 10  # Seconds between batches
-    
-    # Trading Parameters
-    RISK_PER_TRADE = 0.02
-    MIN_RISK_REWARD = 2.0
-    POSITION_SIZE_DAYS = 30
-    
-    # Technical Parameters
-    RSI_OVERSOLD = 30
-    RSI_OVERBOUGHT = 70
-    VOLUME_SPIKE = 1.8
+# =======================
+# CONFIG
+# =======================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# ===== Logging =====
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('bot.log')]
-)
-logger = logging.getLogger(__name__)
+CSV_PATH = "under_100rs_stocks.csv"   # must contain a 'Symbol' column, e.g. ABC.NS
+INTERVAL = "5m"                        # 1m/2m need premium; 5m is usually available
+PERIOD = "5d"                          # enough history for EMA200 and ATR
+LOOP_SECONDS = 60                      # check every minute
+TZ_CHART = ZoneInfo("Asia/Kolkata")    # NSE time
+SEND_PRICE_SYMBOL = "₹"                # currency sign for messages
 
-class ProfessionalTradingBot:
-    def __init__(self):
-        self.app = None
-        self.client = httpx.AsyncClient(timeout=30.0)
-        self.symbols = self._load_symbols()
-        self.portfolio = {}
-        self.market_tz = ZoneInfo("Asia/Kolkata")
-        self.paused = False
-        self.blacklisted_symbols = set()
-        self.valid_symbols = []
-        self.last_request_time = 0
-        self.request_counter = 0
+# Strategy params (same as your Pine defaults)
+FAST_LEN = 20
+SLOW_LEN = 50
+TREND_LEN = 200   # EMA
+RSI_LEN = 14
+RSI_OB = 70
+RSI_OS = 30
+ATR_LEN = 14
+ATR_MULT_SL = 2.0
+ATR_MULT_TP = 3.0
+TRAIL_MULT = 1.5  # ATR trail in points
 
-    # ===== Rate Limited Requests =====
-    async def _rate_limited_request(self):
-        """Enforce rate limiting for Yahoo Finance API"""
-        current_time = time.time()
-        elapsed = current_time - self.last_request_time
-        
-        # Reset counter if more than 1 second has passed
-        if elapsed >= 1:
-            self.request_counter = 0
-            self.last_request_time = current_time
-        
-        # Wait if we've hit the rate limit
-        if self.request_counter >= Config.YFINANCE_RATE_LIMIT:
-            wait_time = 1 - elapsed
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-            self.request_counter = 0
-            self.last_request_time = time.time()
-        
-        self.request_counter += 1
+# =======================
+# STATE
+# =======================
+last_bar_time = {}   # per symbol last processed bar (timestamp)
+positions = {}       # per symbol: None or dict with position state
 
-    # ===== Symbol Handling =====
-    def _load_symbols(self) -> List[str]:
-        """Load and clean symbols from CSV"""
-        try:
-            df = pd.read_csv(Config.SYMBOLS_FILE)
-            symbols = [f"{s.strip().upper()}.NS" for s in df['Symbol'].dropna()]
-            logger.info(f"Loaded {len(symbols)} symbols from CSV")
-            return symbols
-        except Exception as e:
-            logger.critical(f"Failed to load symbols: {e}")
-            sys.exit(1)
+# position schema:
+# {
+#   'side': 'long' | 'short',
+#   'entry_price': float,
+#   'entry_time': pd.Timestamp,
+#   'atr_at_entry': float,
+#   'stop': float,
+#   'take': float,
+#   'trail_points': float,
+#   'trail_stop': float,
+# }
 
-    async def _validate_symbol(self, symbol: str) -> bool:
-        """Validate a single symbol with multiple approaches"""
-        try:
-            await self._rate_limited_request()
-            
-            # Approach 1: Quick price check
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="1d")
-            
-            if not hist.empty and not hist['Close'].isna().all():
-                return True
-                
-            # Approach 2: Full data check if first fails
-            await self._rate_limited_request()
-            data = yf.download(symbol, period="1d", progress=False)
-            
-            if not data.empty and not data['Close'].isna().all():
-                return True
-                
-            logger.warning(f"No valid data for {symbol}")
-            return False
-            
-        except Exception as e:
-            logger.warning(f"Validation failed for {symbol}: {str(e)}")
-            return False
+# =======================
+# HELPERS
+# =======================
+def send_telegram(text: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("⚠️ TELEGRAM_TOKEN or CHAT_ID not set; skipping send.")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+        print(f"[{datetime.now(TZ_CHART).strftime('%H:%M:%S')}] 📲 {text.splitlines()[0]}")
+    except Exception as e:
+        print(f"❌ Telegram send failed: {e}")
 
-    async def _validate_symbols_batch(self):
-        """Validate symbols in batches with rate limiting"""
-        self.valid_symbols = []
-        batch_size = 10
-        delay = Config.VALIDATION_TIMEOUT / (len(self.symbols) / batch_size)
-        
-        for i in range(0, len(self.symbols), batch_size):
-            batch = self.symbols[i:i + batch_size]
-            tasks = [self._validate_symbol(symbol) for symbol in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for symbol, is_valid in zip(batch, results):
-                if is_valid and not isinstance(is_valid, Exception):
-                    self.valid_symbols.append(symbol)
-                    logger.info(f"✅ Validated {symbol}")
-                else:
-                    self.blacklisted_symbols.add(symbol)
-                    logger.warning(f"❌ Failed to validate {symbol}")
-            
-            if i + batch_size < len(self.symbols):
-                await asyncio.sleep(delay)
-
-    # ===== Data Fetching =====
-    async def _fetch_data(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
-        """Fetch market data with rate limiting"""
-        if symbol in self.blacklisted_symbols:
+def safe_download(symbol: str):
+    """Download and sanity-check single-symbol data."""
+    try:
+        df = yf.download(symbol, period=PERIOD, interval=INTERVAL, auto_adjust=True, progress=False)
+        if df is None or df.empty:
             return None
-
-        try:
-            await self._rate_limited_request()
-            
-            # Try direct download first
-            data = await asyncio.to_thread(
-                yf.download,
-                symbol,
-                period="7d" if interval != "1d" else "30d",
-                interval=interval,
-                progress=False,
-                threads=False
-            )
-            
-            if not data.empty:
-                return data
-                
-            # Fallback to Ticker method
-            await self._rate_limited_request()
-            ticker = await asyncio.to_thread(yf.Ticker, symbol)
-            hist = await asyncio.to_thread(
-                ticker.history,
-                period="7d" if interval != "1d" else "30d",
-                interval=interval
-            )
-            
-            return hist if not hist.empty else None
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch {symbol}: {str(e)}")
-            self.blacklisted_symbols.add(symbol)
+        req = {"Open","High","Low","Close","Volume"}
+        if not req.issubset(df.columns):
             return None
-
-    # ===== Trading Logic =====
-    async def _analyze_symbol(self, symbol: str) -> Optional[Dict]:
-        """Analyze symbol for trading opportunities"""
-        daily, intraday = await asyncio.gather(
-            self._fetch_data(symbol, "1d"),
-            self._fetch_data(symbol, "15m")
-        )
-        
-        if daily is None or intraday is None:
-            return None
-
-        try:
-            # Technical Indicators
-            atr = ta.atr(intraday['High'], intraday['Low'], intraday['Close'], length=14).iloc[-1]
-            rsi = ta.rsi(intraday['Close'], length=14).iloc[-1]
-            macd = ta.macd(intraday['Close']).iloc[-1]
-            
-            # Price Action
-            price = intraday['Close'].iloc[-1]
-            stop_loss, take_profit = entry - (1.5 * atr), entry + (3 * atr)
-            risk_reward = (take_profit - price) / (price - stop_loss)
-
-            # Signal Conditions
-            buy_conditions = [
-                rsi < Config.RSI_OVERSOLD,
-                macd['MACD_12_26_9'] > macd['MACDs_12_26_9'],
-                price > daily['Close'].rolling(50).mean().iloc[-1] > daily['Close'].rolling(200).mean().iloc[-1],
-                intraday['Volume'].iloc[-1] > (Config.VOLUME_SPIKE * intraday['Volume'].rolling(20).mean().iloc[-1]),
-                risk_reward >= Config.MIN_RISK_REWARD
-            ]
-
-            if sum(buy_conditions) >= 4:
-                volatility = daily['Close'].pct_change().std()
-                position_size = (10000 * Config.RISK_PER_TRADE) / ((price - stop_loss) * volatility)
-                
-                return {
-                    'symbol': symbol,
-                    'action': 'BUY',
-                    'price': price,
-                    'stop_loss': stop_loss,
-                    'take_profit': take_profit,
-                    'size': int(position_size),
-                    'rationale': [
-                        f"RSI: {rsi:.1f}",
-                        f"ATR: {atr:.2f}",
-                        f"Risk/Reward: 1:{risk_reward:.1f}",
-                        f"Size: {int(position_size)} shares"
-                    ]
-                }
-        except Exception as e:
-            logger.error(f"Analysis error for {symbol}: {str(e)}")
-        
+        # Ensure 1D series per column
+        for c in req:
+            if getattr(df[c], "ndim", 1) != 1:
+                return None
+        return df
+    except Exception:
         return None
 
-    # ===== Execution Methods =====
-    async def _execute_trade(self, signal: Dict):
-        """Execute trade with risk management"""
-        self.portfolio[signal['symbol']] = {
-            'entry': signal['price'],
-            'sl': signal['stop_loss'],
-            'tp': signal['take_profit'],
-            'size': signal['size'],
-            'entry_time': datetime.now()
+def rsi_series(close: pd.Series, length: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def atr_series(high, low, close, length: int) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(window=length, min_periods=length).mean()
+    return atr
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["SMA_FAST"] = out["Close"].rolling(FAST_LEN).mean()
+    out["SMA_SLOW"] = out["Close"].rolling(SLOW_LEN).mean()
+    out["EMA_TREND"] = out["Close"].ewm(span=TREND_LEN, adjust=False).mean()
+    out["RSI"] = rsi_series(out["Close"], RSI_LEN)
+    out["ATR"] = atr_series(out["High"], out["Low"], out["Close"], ATR_LEN)
+
+    out["UPTREND"] = out["Close"] > out["EMA_TREND"]
+    out["DOWNTREND"] = out["Close"] < out["EMA_TREND"]
+
+    # Crossovers (same idea as Pine ta.crossover / crossunder)
+    above = out["SMA_FAST"] > out["SMA_SLOW"]
+    out["XUP"] = (above.astype(int).diff() == 1)
+    out["XDN"] = (above.astype(int).diff() == -1)
+
+    # Raw entry conditions
+    out["RAW_BUY"]  = out["XUP"] & out["UPTREND"] & (out["RSI"] < RSI_OB)
+    out["RAW_SELL"] = out["XDN"] & out["DOWNTREND"] & (out["RSI"] > RSI_OS)
+    return out
+
+def fmt_price(x: float) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "NA"
+    return f"{SEND_PRICE_SYMBOL}{x:.2f}"
+
+# =======================
+# ENTRY & EXIT LOGIC (mirrors your Pine)
+# =======================
+def try_entry(symbol: str, row_prev: pd.Series, row: pd.Series):
+    """
+    Use the **last fully closed bar** (row_prev) to trigger entries,
+    and the **current forming bar** (row) for trailing/exit updates.
+    """
+    state = positions.get(symbol)
+    in_long = (state is not None and state["side"] == "long")
+    in_short = (state is not None and state["side"] == "short")
+
+    # StrongBuy = rawBuy and not inTradeLong
+    if row_prev["RAW_BUY"] and not in_long:
+        entry_price = float(row_prev["Close"])
+        atr = float(row_prev["ATR"])
+        if math.isnan(atr):
+            return  # not enough ATR history
+
+        stop = entry_price - ATR_MULT_SL * atr
+        take = entry_price + ATR_MULT_TP * atr
+        trail_points = TRAIL_MULT * atr
+        trail_stop = entry_price - trail_points  # initialize
+
+        positions[symbol] = {
+            "side": "long",
+            "entry_price": entry_price,
+            "entry_time": row_prev.name,
+            "atr_at_entry": atr,
+            "stop": stop,
+            "take": take,
+            "trail_points": trail_points,
+            "trail_stop": trail_stop,
         }
-        
-        message = [
-            f"🚀 <b>{signal['action']} {signal['symbol']}</b>",
-            f"💰 Entry: ₹{signal['price']:.2f}",
-            f"🛑 Stop-Loss: ₹{signal['stop_loss']:.2f}",
-            f"🎯 Take-Profit: ₹{signal['take_profit']:.2f}",
-            f"📊 Size: {signal['size']} shares",
-            "",
-            "<b>Rationale:</b>",
-            *signal['rationale']
-        ]
-        await self._send_telegram("\n".join(message))
+        send_telegram(
+            f"🚀 STRONG BUY\n"
+            f"{symbol}\n"
+            f"Entry: {fmt_price(entry_price)}  Time: {row_prev.name.tz_convert(TZ_CHART).strftime('%Y-%m-%d %H:%M')}\n"
+            f"SL: {fmt_price(stop)}  TP: {fmt_price(take)}  Trail: {fmt_price(trail_points)}\n"
+            f"RSI: {row_prev['RSI']:.2f}  Trend EMA200 OK"
+        )
+        return
 
-    # ===== Telegram Methods =====
-    async def _send_telegram(self, text: str):
-        """Send message with error handling"""
-        try:
-            await self.app.bot.send_message(
-                chat_id=Config.TELEGRAM_CHAT_ID,
-                text=text,
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            logger.error(f"Telegram send failed: {e}")
+    # StrongSell = rawSell and not inTradeShort
+    if row_prev["RAW_SELL"] and not in_short:
+        entry_price = float(row_prev["Close"])
+        atr = float(row_prev["ATR"])
+        if math.isnan(atr):
+            return
 
-    async def _get_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Telegram status command"""
-        status = [
-            f"📊 <b>Bot Status</b>",
-            f"• Valid Symbols: {len(self.valid_symbols)}",
-            f"• Active Positions: {len(self.portfolio)}",
-            f"• Market: {'Open' if self._is_market_open() else 'Closed'}"
-        ]
-        await update.message.reply_text("\n".join(status), parse_mode='HTML')
+        stop = entry_price + ATR_MULT_SL * atr
+        take = entry_price - ATR_MULT_TP * atr
+        trail_points = TRAIL_MULT * atr
+        trail_stop = entry_price + trail_points
 
-    # ===== Main Loop =====
-    async def run(self):
-        """Complete trading workflow"""
-        try:
-            self.app = Application.builder().token(Config.TELEGRAM_TOKEN).build()
-            self.app.add_handler(CommandHandler("status", self._get_status))
-            
-            await self._send_telegram("🤖 Trading Bot Started")
-            
-            # Validate symbols with rate limiting
-            logger.info("Starting symbol validation...")
-            await self._validate_symbols_batch()
-            
-            if not self.valid_symbols:
-                await self._send_telegram("❌ No valid symbols found! Check logs.")
-                return
-            
-            await self._send_telegram(f"✅ Ready with {len(self.valid_symbols)} valid symbols")
-            
-            # Main trading loop
-            while True:
-                try:
-                    if not self._is_market_open():
-                        await asyncio.sleep(60)
-                        continue
-                        
-                    for symbol in self.valid_symbols:
-                        try:
-                            signal = await self._analyze_symbol(symbol)
-                            if signal:
-                                await self._execute_trade(signal)
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            logger.error(f"Error processing {symbol}: {str(e)}")
-                    
-                    await self._manage_positions()
-                    await asyncio.sleep(300)
-                    
-                except Exception as e:
-                    logger.error(f"Main loop error: {str(e)}")
-                    await asyncio.sleep(60)
-                    
-        except Exception as e:
-            logger.critical(f"Fatal error: {str(e)}")
-            await self._send_telegram(f"💀 Bot crashed: {str(e)}")
+        positions[symbol] = {
+            "side": "short",
+            "entry_price": entry_price,
+            "entry_time": row_prev.name,
+            "atr_at_entry": atr,
+            "stop": stop,
+            "take": take,
+            "trail_points": trail_points,
+            "trail_stop": trail_stop,
+        }
+        send_telegram(
+            f"🔻 STRONG SELL\n"
+            f"{symbol}\n"
+            f"Entry: {fmt_price(entry_price)}  Time: {row_prev.name.tz_convert(TZ_CHART).strftime('%Y-%m-%d %H:%M')}\n"
+            f"SL: {fmt_price(stop)}  TP: {fmt_price(take)}  Trail: {fmt_price(trail_points)}\n"
+            f"RSI: {row_prev['RSI']:.2f}  Trend EMA200 OK"
+        )
 
-async def main():
-    bot = ProfessionalTradingBot()
-    await bot.run()
+def try_exit(symbol: str, row_prev: pd.Series, row: pd.Series):
+    """
+    Apply exits on the **current forming bar** (row) using Pine-like rules:
+      - strategy.exit with stop, limit, trail_points
+      - extra exit: RSI long<50 / short>50
+    """
+    state = positions.get(symbol)
+    if not state:
+        return
+
+    side = state["side"]
+    price_now = float(row["Close"])  # current bar price (forming)
+    rsi_now = float(row["RSI"])
+
+    # Update trailing stop (fixed trail_points from entry; move with favorable price)
+    if side == "long":
+        new_trail_stop = price_now - state["trail_points"]
+        if new_trail_stop > state["trail_stop"]:
+            state["trail_stop"] = new_trail_stop
+    else:
+        new_trail_stop = price_now + state["trail_points"]
+        if new_trail_stop < state["trail_stop"]:
+            state["trail_stop"] = new_trail_stop
+
+    # Check exits in priority: hard SL/TP then trailing, then RSI rule
+    exit_reason = None
+    exit_price = price_now
+
+    if side == "long":
+        if price_now <= state["stop"]:
+            exit_reason = "Stop Loss hit"
+            exit_price = state["stop"]
+        elif price_now >= state["take"]:
+            exit_reason = "Take Profit hit"
+            exit_price = state["take"]
+        elif price_now <= state["trail_stop"]:
+            exit_reason = "Trailing Stop hit"
+            exit_price = state["trail_stop"]
+        elif rsi_now < 50:
+            exit_reason = "RSI < 50 exit"
+    else:  # short
+        if price_now >= state["stop"]:
+            exit_reason = "Stop Loss hit"
+            exit_price = state["stop"]
+        elif price_now <= state["take"]:
+            exit_reason = "Take Profit hit"
+            exit_price = state["take"]
+        elif price_now >= state["trail_stop"]:
+            exit_reason = "Trailing Stop hit"
+            exit_price = state["trail_stop"]
+        elif rsi_now > 50:
+            exit_reason = "RSI > 50 exit"
+
+    if exit_reason:
+        pnl = (exit_price - state["entry_price"]) * (1 if side == "long" else -1)
+        send_telegram(
+            f"✅ EXIT {side.upper()} • {symbol}\n"
+            f"Reason: {exit_reason}\n"
+            f"Entry: {fmt_price(state['entry_price'])} @ {state['entry_time'].tz_convert(TZ_CHART).strftime('%Y-%m-%d %H:%M')}\n"
+            f"Exit : {fmt_price(exit_price)} @ {row.name.tz_convert(TZ_CHART).strftime('%Y-%m-%d %H:%M')}\n"
+            f"PnL  : {fmt_price(pnl)}"
+        )
+        positions[symbol] = None
+
+# =======================
+# MAIN LOOP
+# =======================
+def load_symbols():
+    try:
+        df = pd.read_csv(CSV_PATH)
+        syms = df["Symbol"].dropna().astype(str).unique().tolist()
+        return syms
+    except Exception as e:
+        print(f"❌ Failed to load {CSV_PATH}: {e}")
+        return []
+
+def process_symbol(sym: str):
+    df = safe_download(sym)
+    if df is None or len(df) < max(TREND_LEN, SLOW_LEN, ATR_LEN) + 5:
+        return  # not enough/clean data
+
+    # yfinance indexes are tz-aware in UTC; convert for consistency
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(timezone.utc)
+    df = compute_indicators(df)
+
+    # Work with the last two rows:
+    # row_prev = last fully closed bar, row = current forming bar
+    if len(df) < 3:
+        return
+    row_prev = df.iloc[-2]
+    row = df.iloc[-1]
+
+    # Avoid reprocessing same bar
+    bar_time = row_prev.name
+    if last_bar_time.get(sym) == bar_time:
+        return
+    last_bar_time[sym] = bar_time
+
+    # ENTRY first (on closed bar), then EXIT updates on current bar
+    try_entry(sym, row_prev, row)
+    try_exit(sym, row_prev, row)
+
+def main():
+    syms = load_symbols()
+    if not syms:
+        print("❌ No symbols found. Ensure under_100rs_stocks.csv has a 'Symbol' column.")
+        return
+
+    for s in syms:
+        positions[s] = None
+        last_bar_time[s] = None
+
+    send_telegram(f"✅ Python strategy started. Watching {len(syms)} symbols on {INTERVAL} bars.")
+
+    while True:
+        now = datetime.now(TZ_CHART).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] Tick… checking {len(syms)} symbols")
+        for s in syms:
+            try:
+                process_symbol(s)
+            except Exception as e:
+                # Keep running even if a symbol glitches
+                print(f"❌ {s}: {e}")
+        time.sleep(LOOP_SECONDS)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
