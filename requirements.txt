@@ -2,6 +2,7 @@
 yfinance==0.2.31
 pandas==1.5.3
 numpy==1.23.5
+ta==0.11.0
 
 # Telegram (with compatible HTTPX)
 python-telegram-bot==20.3
